@@ -20,7 +20,11 @@ type SetupScreen struct {
 	config           *Config
 	vault            *vault.Vault
 	clipboardManager *clipboard.Manager
+	confirmation     textinput.Model
+	awaitingConfirm  bool
 }
+
+const recoveryConfirmText = "I have written this recovery code down"
 
 // NewSetupScreen creates a new setup screen.
 func NewSetupScreen(config *Config, clipboardManager *clipboard.Manager) *SetupScreen {
@@ -35,23 +39,47 @@ func NewSetupScreen(config *Config, clipboardManager *clipboard.Manager) *SetupS
 	inputs[1].Placeholder = "Confirm password"
 	inputs[1].EchoMode = textinput.EchoPassword
 
+	confirmation := textinput.New()
+	confirmation.Placeholder = recoveryConfirmText
+
 	return &SetupScreen{
 		inputs:           inputs,
 		cursor:           0,
 		config:           config,
 		clipboardManager: clipboardManager,
+		confirmation:     confirmation,
 	}
-}
-
-func hideRecoveryAfter(d time.Duration) tea.Cmd {
-	return tea.Tick(d, func(t time.Time) tea.Msg {
-		return HideRecoveryMsg{}
-	})
 }
 
 func (s *SetupScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		if s.awaitingConfirm {
+			if msg.String() == "enter" {
+				if !strings.EqualFold(strings.TrimSpace(s.confirmation.Value()), recoveryConfirmText) {
+					s.errorMsg = "Type the confirmation phrase exactly to proceed"
+					return s, nil
+				}
+
+				if s.vault != nil {
+					s.vault.ConsumePendingRecoveryPhrase()
+				}
+				ctx := &Context{
+					Vault:            s.vault,
+					Config:           s.config,
+					ClipboardManager: s.clipboardManager,
+					LastActivity:     time.Now(),
+				}
+				s.recoveryCode = ""
+				s.awaitingConfirm = false
+				return NewListScreen(ctx), nil
+			}
+
+			var cmd tea.Cmd
+			s.confirmation, cmd = s.confirmation.Update(msg)
+			return s, cmd
+		}
+
 		newCursor, submit := NavigateInputs(msg, s.cursor, len(s.inputs))
 		if newCursor != s.cursor {
 			s.cursor = newCursor
@@ -83,20 +111,10 @@ func (s *SetupScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 
 			s.recoveryCode = recovery
 			s.vault = v
-
-			// Show recovery code for 10 seconds before transitioning
-			return s, hideRecoveryAfter(10 * time.Second)
-		}
-
-	case HideRecoveryMsg:
-		if s.recoveryCode != "" {
-			ctx := &Context{
-				Vault:            s.vault,
-				Config:           s.config,
-				ClipboardManager: s.clipboardManager,
-				LastActivity:     time.Now(),
-			}
-			return NewListScreen(ctx), nil
+			s.awaitingConfirm = true
+			s.confirmation.SetValue("")
+			s.confirmation.Focus()
+			return s, nil
 		}
 	}
 
@@ -124,8 +142,15 @@ func (s *SetupScreen) View() string {
 		b.WriteString(HighlightStyle.Render("RECOVERY CODE (save securely):"))
 		b.WriteString("\n")
 		b.WriteString(SuccessStyle.Render(s.recoveryCode))
+		b.WriteString("\n\n")
+		b.WriteString(HelpStyle.Render("Type the confirmation phrase below to continue"))
+	}
+
+	if s.awaitingConfirm {
+		b.WriteString("\n\n")
+		b.WriteString(HighlightStyle.Render("Confirmation (exact phrase):"))
 		b.WriteString("\n")
-		b.WriteString(HelpStyle.Render("This code will disappear in 10 seconds..."))
+		b.WriteString(s.confirmation.View())
 	}
 
 	if s.errorMsg != "" {

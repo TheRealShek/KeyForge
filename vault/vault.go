@@ -19,36 +19,62 @@ var (
 	ErrIdentityRequired   = errors.New("email or username is required")
 	ErrCredentialNotFound = errors.New("credential not found")
 	ErrVaultLocked        = errors.New("vault is locked")
+	ErrInvalidRecovery    = errors.New("invalid recovery code")
 )
 
 // Vault manages encrypted credential storage with thread-safe operations.
 type Vault struct {
-	mu          sync.RWMutex
-	data        VaultData
-	encrypted   *EncryptedVault
-	masterKey   *crypto.Key
-	recoveryKey *crypto.Key
-	filePath    string
-	iterations  int
+	mu                    sync.RWMutex
+	data                  VaultData
+	encrypted             *EncryptedVault
+	masterKey             *crypto.Key
+	vaultKey              []byte
+	filePath              string
+	iterations            int
+	pendingRecoveryPhrase string
 }
 
-// CreateVault creates a new encrypted vault with master password and recovery code.
+// RecoverySession encapsulates a verified recovery attempt that still
+// requires the user to set a new master password.
+type RecoverySession struct {
+	encrypted     *EncryptedVault
+	vaultKey      []byte
+	filePath      string
+	iterations    int
+	pendingPhrase string
+}
+
+// CreateVault creates a new encrypted vault with a master password and
+// returns the recovery phrase (as a space-separated string).
 func CreateVault(masterPassword string, iterations int) (*Vault, string, error) {
 	masterKey, err := crypto.NewKey(masterPassword, iterations)
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to create master key: %w", err)
 	}
 
-	recoveryCode, err := crypto.GenerateRecoveryCode()
+	recoveryWords, err := crypto.GenerateRecoveryPhrase(0)
 	if err != nil {
 		masterKey.Destroy()
-		return nil, "", fmt.Errorf("failed to generate recovery code: %w", err)
+		return nil, "", fmt.Errorf("failed to generate recovery phrase: %w", err)
 	}
 
-	recoveryKey, err := crypto.NewKey(recoveryCode, iterations)
+	recoverySalt, err := crypto.GenerateRandomBytes(32)
+	if err != nil {
+		masterKey.Destroy()
+		return nil, "", fmt.Errorf("failed to create recovery salt: %w", err)
+	}
+
+	recoveryKey, err := crypto.DeriveRecoveryKey(recoveryWords, recoverySalt, iterations)
 	if err != nil {
 		masterKey.Destroy()
 		return nil, "", fmt.Errorf("failed to create recovery key: %w", err)
+	}
+
+	vaultKey, err := crypto.GenerateRandomBytes(32)
+	if err != nil {
+		masterKey.Destroy()
+		recoveryKey.Destroy()
+		return nil, "", fmt.Errorf("failed to generate vault key: %w", err)
 	}
 
 	vaultData := VaultData{Credentials: []Credential{}}
@@ -56,78 +82,76 @@ func CreateVault(masterPassword string, iterations int) (*Vault, string, error) 
 	if err != nil {
 		masterKey.Destroy()
 		recoveryKey.Destroy()
+		crypto.SecureWipeBytes(vaultKey)
 		return nil, "", fmt.Errorf("failed to marshal vault data: %w", err)
 	}
 	defer crypto.SecureWipeBytes(jsonData)
 
-	masterData, err := masterKey.Encrypt(jsonData)
+	vaultCiphertext, err := crypto.EncryptWithKey(vaultKey, jsonData)
 	if err != nil {
 		masterKey.Destroy()
 		recoveryKey.Destroy()
-		return nil, "", fmt.Errorf("failed to encrypt with master key: %w", err)
+		crypto.SecureWipeBytes(vaultKey)
+		return nil, "", fmt.Errorf("failed to encrypt vault data: %w", err)
 	}
 
-	recoveryData, err := recoveryKey.Encrypt(jsonData)
+	masterWrap, err := masterKey.Encrypt(vaultKey)
 	if err != nil {
 		masterKey.Destroy()
 		recoveryKey.Destroy()
-		return nil, "", fmt.Errorf("failed to encrypt with recovery key: %w", err)
+		crypto.SecureWipeBytes(vaultKey)
+		return nil, "", fmt.Errorf("failed to wrap vault key with master key: %w", err)
 	}
 
-	// Store hash of recovery code for validation
-	recoveryHash, err := crypto.DeriveKey(recoveryCode, recoveryKey.Salt(), iterations)
+	recoveryWrap, err := recoveryKey.Encrypt(vaultKey)
 	if err != nil {
 		masterKey.Destroy()
 		recoveryKey.Destroy()
-		return nil, "", fmt.Errorf("failed to derive recovery hash: %w", err)
-	}
-	defer recoveryHash.Destroy()
-
-	// Encrypt recovery code with master key for future use
-	encryptedRecoveryCode, err := masterKey.Encrypt([]byte(recoveryCode))
-	if err != nil {
-		masterKey.Destroy()
-		recoveryKey.Destroy()
-		return nil, "", fmt.Errorf("failed to encrypt recovery code: %w", err)
+		crypto.SecureWipeBytes(vaultKey)
+		return nil, "", fmt.Errorf("failed to wrap vault key with recovery key: %w", err)
 	}
 
 	encrypted := &EncryptedVault{
-		Version:               crypto.CryptoVersion,
-		MasterSalt:            masterKey.Salt(),
-		RecoverySalt:          recoveryKey.Salt(),
-		MasterData:            masterData,
-		RecoveryData:          recoveryData,
-		RecoveryHash:          recoveryHash.Salt(), // Store as verification hash
-		EncryptedRecoveryCode: encryptedRecoveryCode,
+		Version:         crypto.CryptoVersion,
+		Iterations:      iterations,
+		MasterSalt:      masterKey.Salt(),
+		RecoverySalt:    recoveryKey.Salt(),
+		MasterWrap:      masterWrap,
+		RecoveryWrap:    recoveryWrap,
+		VaultCiphertext: vaultCiphertext,
 	}
 
 	vaultPath, err := GetVaultPath()
 	if err != nil {
 		masterKey.Destroy()
 		recoveryKey.Destroy()
+		crypto.SecureWipeBytes(vaultKey)
 		return nil, "", err
 	}
 
 	if err := SaveEncryptedVault(vaultPath, encrypted); err != nil {
 		masterKey.Destroy()
 		recoveryKey.Destroy()
+		crypto.SecureWipeBytes(vaultKey)
 		return nil, "", fmt.Errorf("failed to save vault: %w", err)
 	}
 
 	vault := &Vault{
-		data:        vaultData,
-		encrypted:   encrypted,
-		masterKey:   masterKey,
-		recoveryKey: recoveryKey,
-		filePath:    vaultPath,
-		iterations:  iterations,
+		data:                  vaultData,
+		encrypted:             encrypted,
+		masterKey:             masterKey,
+		vaultKey:              vaultKey,
+		filePath:              vaultPath,
+		iterations:            iterations,
+		pendingRecoveryPhrase: crypto.RecoveryPhraseString(recoveryWords),
 	}
 
-	return vault, recoveryCode, nil
+	recoveryKey.Destroy()
+	return vault, vault.pendingRecoveryPhrase, nil
 }
 
-// OpenVault opens an existing vault with either master password or recovery code.
-func OpenVault(password string, isRecoveryCode bool, iterations int) (*Vault, error) {
+// OpenVault opens an existing vault with the master password.
+func OpenVault(masterPassword string, iterations int) (*Vault, error) {
 	vaultPath, err := GetVaultPath()
 	if err != nil {
 		return nil, err
@@ -138,121 +162,99 @@ func OpenVault(password string, isRecoveryCode bool, iterations int) (*Vault, er
 		return nil, err
 	}
 
-	var key *crypto.Key
-	var recoveryKey *crypto.Key
-	var encryptedData []byte
-
-	if isRecoveryCode {
-		key, err = crypto.DeriveKey(password, encrypted.RecoverySalt, iterations)
-		if err != nil {
-			return nil, fmt.Errorf("failed to derive recovery key: %w", err)
-		}
-
-		// Verify recovery code using constant-time comparison
-		testHash, err := crypto.DeriveKey(password, encrypted.RecoverySalt, iterations)
-		if err != nil {
-			key.Destroy()
-			return nil, fmt.Errorf("failed to verify recovery code: %w", err)
-		}
-		defer testHash.Destroy()
-
-		if !crypto.ConstantTimeCompare(testHash.Salt(), encrypted.RecoveryHash) {
-			key.Destroy()
-			return nil, errors.New("invalid recovery code")
-		}
-
-		encryptedData = encrypted.RecoveryData
-
-		// Also derive master key from recovery for future operations
-		// (In production, you'd prompt for new master password)
-		recoveryKey = key
-	} else {
-		key, err = crypto.DeriveKey(password, encrypted.MasterSalt, iterations)
-		if err != nil {
-			return nil, fmt.Errorf("failed to derive master key: %w", err)
-		}
-		encryptedData = encrypted.MasterData
-
-		// Decrypt stored recovery code to derive recovery key
-		if len(encrypted.EncryptedRecoveryCode) > 0 {
-			recoveryCodeBytes, err := key.Decrypt(encrypted.EncryptedRecoveryCode)
-			if err != nil {
-				key.Destroy()
-				return nil, fmt.Errorf("failed to decrypt recovery code: %w", err)
-			}
-			defer crypto.SecureWipeBytes(recoveryCodeBytes)
-
-			recoveryKey, err = crypto.DeriveKey(string(recoveryCodeBytes), encrypted.RecoverySalt, iterations)
-			if err != nil {
-				key.Destroy()
-				return nil, fmt.Errorf("failed to derive recovery key from stored code: %w", err)
-			}
-		}
+	// Handle legacy vaults transparently via migration.
+	if encrypted.Version == 1 {
+		return migrateFromV1WithMaster(vaultPath, encrypted, masterPassword, iterations)
 	}
 
-	jsonData, err := key.Decrypt(encryptedData)
+	return openV2Vault(vaultPath, encrypted, masterPassword, iterations)
+}
+
+// BeginRecovery validates a recovery phrase and prepares a reset session.
+// It never opens the vault contents directly.
+func BeginRecovery(phrase string, iterations int) (*RecoverySession, error) {
+	vaultPath, err := GetVaultPath()
 	if err != nil {
-		key.Destroy()
-		if recoveryKey != nil {
-			recoveryKey.Destroy()
-		}
-		return nil, errors.New("invalid password or corrupted vault")
+		return nil, err
 	}
-	defer crypto.SecureWipeBytes(jsonData)
 
-	var vaultData VaultData
-	if err := json.Unmarshal(jsonData, &vaultData); err != nil {
-		key.Destroy()
-		if recoveryKey != nil {
-			recoveryKey.Destroy()
-		}
+	encrypted, err := LoadEncryptedVault(vaultPath)
+	if err != nil {
+		return nil, err
+	}
+
+	if encrypted.Version == 1 {
+		return beginRecoveryV1(vaultPath, encrypted, phrase, iterations)
+	}
+
+	return beginRecoveryV2(vaultPath, encrypted, phrase, iterations)
+}
+
+// Complete finalizes a recovery session by setting a new master password.
+func (s *RecoverySession) Complete(newMasterPassword string) (*Vault, error) {
+	newMasterKey, err := crypto.NewKey(newMasterPassword, s.iterations)
+	if err != nil {
+		return nil, fmt.Errorf("failed to derive new master key: %w", err)
+	}
+
+	masterWrap, err := newMasterKey.Encrypt(s.vaultKey)
+	if err != nil {
+		newMasterKey.Destroy()
+		return nil, fmt.Errorf("failed to wrap vault key with new master key: %w", err)
+	}
+
+	s.encrypted.MasterWrap = masterWrap
+	s.encrypted.MasterSalt = newMasterKey.Salt()
+	s.encrypted.Iterations = s.iterations
+	s.encrypted.Version = crypto.CryptoVersion
+
+	if err := SaveEncryptedVault(s.filePath, s.encrypted); err != nil {
+		newMasterKey.Destroy()
+		return nil, fmt.Errorf("failed to save vault after recovery: %w", err)
+	}
+
+	plaintext, err := crypto.DecryptWithKey(s.vaultKey, s.encrypted.VaultCiphertext)
+	if err != nil {
+		newMasterKey.Destroy()
+		return nil, fmt.Errorf("failed to decrypt vault contents: %w", err)
+	}
+	defer crypto.SecureWipeBytes(plaintext)
+
+	var data VaultData
+	if err := json.Unmarshal(plaintext, &data); err != nil {
+		newMasterKey.Destroy()
 		return nil, fmt.Errorf("failed to parse vault data: %w", err)
 	}
 
+	vaultKeyCopy := append([]byte{}, s.vaultKey...)
 	vault := &Vault{
-		data:        vaultData,
-		encrypted:   encrypted,
-		masterKey:   key,
-		recoveryKey: recoveryKey,
-		filePath:    vaultPath,
-		iterations:  iterations,
+		data:                  data,
+		encrypted:             s.encrypted,
+		masterKey:             newMasterKey,
+		vaultKey:              vaultKeyCopy,
+		filePath:              s.filePath,
+		iterations:            s.iterations,
+		pendingRecoveryPhrase: s.pendingPhrase,
 	}
 
+	crypto.SecureWipeBytes(s.vaultKey)
 	return vault, nil
 }
 
-// Save persists the vault to disk, updating both master and recovery encryptions.
+// ConsumePendingRecoveryPhrase returns the pending phrase once and clears it.
+func (v *Vault) ConsumePendingRecoveryPhrase() string {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	phrase := v.pendingRecoveryPhrase
+	v.pendingRecoveryPhrase = ""
+	return phrase
+}
+
+// Save persists the vault to disk using the master key to wrap the vault key.
 func (v *Vault) Save() error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-
-	jsonData, err := json.Marshal(v.data)
-	if err != nil {
-		return fmt.Errorf("failed to marshal vault data: %w", err)
-	}
-	defer crypto.SecureWipeBytes(jsonData)
-
-	// Update master encryption
-	masterData, err := v.masterKey.Encrypt(jsonData)
-	if err != nil {
-		return fmt.Errorf("failed to encrypt with master key: %w", err)
-	}
-	v.encrypted.MasterData = masterData
-
-	// Update recovery encryption if recovery key is available
-	if v.recoveryKey != nil {
-		recoveryData, err := v.recoveryKey.Encrypt(jsonData)
-		if err != nil {
-			return fmt.Errorf("failed to encrypt with recovery key: %w", err)
-		}
-		v.encrypted.RecoveryData = recoveryData
-	}
-
-	if err := SaveEncryptedVault(v.filePath, v.encrypted); err != nil {
-		return fmt.Errorf("failed to save vault: %w", err)
-	}
-
-	return nil
+	return v.saveLocked()
 }
 
 // AddCredential adds a new credential to the vault.
@@ -264,14 +266,12 @@ func (v *Vault) AddCredential(cred Credential) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
-	// Assign stable ID
 	cred.ID = uuid.New().String()
 	cred.Created = time.Now()
 	cred.Modified = time.Now()
-
 	v.data.Credentials = append(v.data.Credentials, cred)
 
-	return v.save()
+	return v.saveLocked()
 }
 
 // UpdateCredential updates an existing credential by ID.
@@ -289,7 +289,7 @@ func (v *Vault) UpdateCredential(id string, cred Credential) error {
 			cred.Created = existing.Created
 			cred.Modified = time.Now()
 			v.data.Credentials[i] = cred
-			return v.save()
+			return v.saveLocked()
 		}
 	}
 
@@ -304,7 +304,7 @@ func (v *Vault) DeleteCredential(id string) error {
 	for i, cred := range v.data.Credentials {
 		if cred.ID == id {
 			v.data.Credentials = append(v.data.Credentials[:i], v.data.Credentials[i+1:]...)
-			return v.save()
+			return v.saveLocked()
 		}
 	}
 
@@ -342,13 +342,13 @@ func (v *Vault) SearchCredentials(query string) []Credential {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
 
-	query = strings.ToLower(query)
+	q := strings.ToLower(query)
 	var results []Credential
 
 	for _, cred := range v.data.Credentials {
-		if strings.Contains(strings.ToLower(cred.Site), query) ||
-			strings.Contains(strings.ToLower(cred.Email), query) ||
-			strings.Contains(strings.ToLower(cred.Username), query) {
+		if strings.Contains(strings.ToLower(cred.Site), q) ||
+			strings.Contains(strings.ToLower(cred.Email), q) ||
+			strings.Contains(strings.ToLower(cred.Username), q) {
 			results = append(results, cred.Copy())
 		}
 	}
@@ -356,7 +356,7 @@ func (v *Vault) SearchCredentials(query string) []Credential {
 	return results
 }
 
-// ChangeMasterPassword changes the master password and re-encrypts the vault.
+// ChangeMasterPassword changes the master password and re-wraps the vault key.
 func (v *Vault) ChangeMasterPassword(newPassword string) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -366,64 +366,23 @@ func (v *Vault) ChangeMasterPassword(newPassword string) error {
 		return fmt.Errorf("failed to create new key: %w", err)
 	}
 
-	jsonData, err := json.Marshal(v.data)
+	masterWrap, err := newKey.Encrypt(v.vaultKey)
 	if err != nil {
 		newKey.Destroy()
-		return fmt.Errorf("failed to marshal vault data: %w", err)
-	}
-	defer crypto.SecureWipeBytes(jsonData)
-
-	// Encrypt with new master key
-	masterData, err := newKey.Encrypt(jsonData)
-	if err != nil {
-		newKey.Destroy()
-		return fmt.Errorf("failed to encrypt with new key: %w", err)
+		return fmt.Errorf("failed to wrap vault key: %w", err)
 	}
 
-	// Update both master and recovery encryptions
-	v.encrypted.MasterData = masterData
+	v.encrypted.MasterWrap = masterWrap
 	v.encrypted.MasterSalt = newKey.Salt()
+	v.encrypted.Iterations = v.iterations
 
-	// Re-encrypt with recovery key if available
-	if v.recoveryKey != nil {
-		recoveryData, err := v.recoveryKey.Encrypt(jsonData)
-		if err != nil {
-			newKey.Destroy()
-			return fmt.Errorf("failed to re-encrypt with recovery key: %w", err)
-		}
-		v.encrypted.RecoveryData = recoveryData
-
-		// Re-encrypt recovery code with new master key
-		// First, get the recovery code by deriving from recovery key salt
-		// We need to store the plaintext recovery code temporarily
-		// For now, decrypt the old encrypted recovery code first
-		if len(v.encrypted.EncryptedRecoveryCode) > 0 {
-			recoveryCodeBytes, err := v.masterKey.Decrypt(v.encrypted.EncryptedRecoveryCode)
-			if err != nil {
-				newKey.Destroy()
-				return fmt.Errorf("failed to decrypt recovery code: %w", err)
-			}
-			defer crypto.SecureWipeBytes(recoveryCodeBytes)
-
-			// Re-encrypt with new master key
-			newEncryptedRecoveryCode, err := newKey.Encrypt(recoveryCodeBytes)
-			if err != nil {
-				newKey.Destroy()
-				return fmt.Errorf("failed to re-encrypt recovery code: %w", err)
-			}
-			v.encrypted.EncryptedRecoveryCode = newEncryptedRecoveryCode
-		}
-	}
-
-	if err := SaveEncryptedVault(v.filePath, v.encrypted); err != nil {
+	if err := v.saveLocked(); err != nil {
 		newKey.Destroy()
-		return fmt.Errorf("failed to save vault: %w", err)
+		return err
 	}
 
-	// Destroy old key and swap
 	v.masterKey.Destroy()
 	v.masterKey = newKey
-
 	return nil
 }
 
@@ -445,39 +404,272 @@ func (v *Vault) Close() {
 		v.masterKey = nil
 	}
 
-	if v.recoveryKey != nil {
-		v.recoveryKey.Destroy()
-		v.recoveryKey = nil
+	if len(v.vaultKey) > 0 {
+		crypto.SecureWipeBytes(v.vaultKey)
+		v.vaultKey = nil
 	}
 
-	// Clear credentials from memory
 	for i := range v.data.Credentials {
 		crypto.SecureWipeBytes([]byte(v.data.Credentials[i].Password))
 	}
 	v.data.Credentials = nil
 }
 
-// save is the internal save method (caller must hold lock).
-func (v *Vault) save() error {
+// saveLocked assumes the caller holds v.mu.
+func (v *Vault) saveLocked() error {
 	jsonData, err := json.Marshal(v.data)
 	if err != nil {
 		return fmt.Errorf("failed to marshal vault data: %w", err)
 	}
 	defer crypto.SecureWipeBytes(jsonData)
 
-	masterData, err := v.masterKey.Encrypt(jsonData)
+	ciphertext, err := crypto.EncryptWithKey(v.vaultKey, jsonData)
 	if err != nil {
-		return fmt.Errorf("failed to encrypt with master key: %w", err)
+		return fmt.Errorf("failed to encrypt vault data: %w", err)
 	}
-	v.encrypted.MasterData = masterData
+	v.encrypted.VaultCiphertext = ciphertext
+	v.encrypted.Version = crypto.CryptoVersion
+	v.encrypted.Iterations = v.iterations
 
-	if v.recoveryKey != nil {
-		recoveryData, err := v.recoveryKey.Encrypt(jsonData)
-		if err != nil {
-			return fmt.Errorf("failed to encrypt with recovery key: %w", err)
-		}
-		v.encrypted.RecoveryData = recoveryData
+	masterWrap, err := v.masterKey.Encrypt(v.vaultKey)
+	if err != nil {
+		return fmt.Errorf("failed to wrap vault key: %w", err)
 	}
+	v.encrypted.MasterWrap = masterWrap
 
 	return SaveEncryptedVault(v.filePath, v.encrypted)
+}
+
+func openV2Vault(vaultPath string, encrypted *EncryptedVault, masterPassword string, fallbackIterations int) (*Vault, error) {
+	iterations := encrypted.Iterations
+	if iterations == 0 {
+		iterations = fallbackIterations
+	}
+
+	masterKey, err := crypto.DeriveKey(masterPassword, encrypted.MasterSalt, iterations)
+	if err != nil {
+		return nil, fmt.Errorf("failed to derive master key: %w", err)
+	}
+
+	vaultKey, err := masterKey.Decrypt(encrypted.MasterWrap)
+	if err != nil {
+		masterKey.Destroy()
+		return nil, errors.New("invalid master password")
+	}
+
+	plaintext, err := crypto.DecryptWithKey(vaultKey, encrypted.VaultCiphertext)
+	if err != nil {
+		masterKey.Destroy()
+		crypto.SecureWipeBytes(vaultKey)
+		return nil, errors.New("invalid master password")
+	}
+	defer crypto.SecureWipeBytes(plaintext)
+
+	var data VaultData
+	if err := json.Unmarshal(plaintext, &data); err != nil {
+		masterKey.Destroy()
+		crypto.SecureWipeBytes(vaultKey)
+		return nil, fmt.Errorf("failed to parse vault data: %w", err)
+	}
+
+	vault := &Vault{
+		data:       data,
+		encrypted:  encrypted,
+		masterKey:  masterKey,
+		vaultKey:   vaultKey,
+		filePath:   vaultPath,
+		iterations: iterations,
+	}
+
+	return vault, nil
+}
+
+func migrateFromV1WithMaster(vaultPath string, encrypted *EncryptedVault, masterPassword string, iterations int) (*Vault, error) {
+	masterKey, err := crypto.DeriveKey(masterPassword, encrypted.MasterSalt, iterations)
+	if err != nil {
+		return nil, fmt.Errorf("failed to derive legacy master key: %w", err)
+	}
+
+	plaintext, err := masterKey.Decrypt(encrypted.MasterData)
+	if err != nil {
+		masterKey.Destroy()
+		return nil, errors.New("invalid master password")
+	}
+	defer crypto.SecureWipeBytes(plaintext)
+
+	var data VaultData
+	if err := json.Unmarshal(plaintext, &data); err != nil {
+		masterKey.Destroy()
+		return nil, fmt.Errorf("failed to parse legacy vault data: %w", err)
+	}
+
+	recoveryWords, err := crypto.GenerateRecoveryPhrase(0)
+	if err != nil {
+		masterKey.Destroy()
+		return nil, fmt.Errorf("failed to generate recovery phrase: %w", err)
+	}
+
+	recoverySalt, err := crypto.GenerateRandomBytes(32)
+	if err != nil {
+		masterKey.Destroy()
+		return nil, fmt.Errorf("failed to generate recovery salt: %w", err)
+	}
+
+	recoveryKey, err := crypto.DeriveRecoveryKey(recoveryWords, recoverySalt, iterations)
+	if err != nil {
+		masterKey.Destroy()
+		return nil, fmt.Errorf("failed to derive recovery key: %w", err)
+	}
+	defer recoveryKey.Destroy()
+
+	vaultKey, err := crypto.GenerateRandomBytes(32)
+	if err != nil {
+		masterKey.Destroy()
+		return nil, fmt.Errorf("failed to generate vault key: %w", err)
+	}
+
+	vaultCiphertext, err := crypto.EncryptWithKey(vaultKey, plaintext)
+	if err != nil {
+		masterKey.Destroy()
+		crypto.SecureWipeBytes(vaultKey)
+		return nil, fmt.Errorf("failed to encrypt vault during migration: %w", err)
+	}
+
+	masterWrap, err := masterKey.Encrypt(vaultKey)
+	if err != nil {
+		masterKey.Destroy()
+		crypto.SecureWipeBytes(vaultKey)
+		return nil, fmt.Errorf("failed to wrap vault key during migration: %w", err)
+	}
+
+	recoveryWrap, err := recoveryKey.Encrypt(vaultKey)
+	if err != nil {
+		masterKey.Destroy()
+		crypto.SecureWipeBytes(vaultKey)
+		return nil, fmt.Errorf("failed to wrap recovery key during migration: %w", err)
+	}
+
+	updated := &EncryptedVault{
+		Version:         crypto.CryptoVersion,
+		Iterations:      iterations,
+		MasterSalt:      masterKey.Salt(),
+		RecoverySalt:    recoveryKey.Salt(),
+		MasterWrap:      masterWrap,
+		RecoveryWrap:    recoveryWrap,
+		VaultCiphertext: vaultCiphertext,
+	}
+
+	if err := SaveEncryptedVault(vaultPath, updated); err != nil {
+		masterKey.Destroy()
+		crypto.SecureWipeBytes(vaultKey)
+		return nil, fmt.Errorf("failed to save migrated vault: %w", err)
+	}
+
+	vault := &Vault{
+		data:                  data,
+		encrypted:             updated,
+		masterKey:             masterKey,
+		vaultKey:              vaultKey,
+		filePath:              vaultPath,
+		iterations:            iterations,
+		pendingRecoveryPhrase: crypto.RecoveryPhraseString(recoveryWords),
+	}
+
+	return vault, nil
+}
+
+func beginRecoveryV2(vaultPath string, encrypted *EncryptedVault, phrase string, iterations int) (*RecoverySession, error) {
+	if iterations == 0 {
+		iterations = encrypted.Iterations
+	}
+
+	recoveryKey, err := crypto.DeriveRecoveryKeyFromPhrase(phrase, encrypted.RecoverySalt, iterations)
+	if err != nil {
+		return nil, ErrInvalidRecovery
+	}
+	defer recoveryKey.Destroy()
+
+	vaultKey, err := recoveryKey.Decrypt(encrypted.RecoveryWrap)
+	if err != nil {
+		return nil, ErrInvalidRecovery
+	}
+
+	return &RecoverySession{
+		encrypted:  encrypted,
+		vaultKey:   vaultKey,
+		filePath:   vaultPath,
+		iterations: iterations,
+	}, nil
+}
+
+func beginRecoveryV1(vaultPath string, encrypted *EncryptedVault, code string, iterations int) (*RecoverySession, error) {
+	// Legacy recovery codes may not be word-based; derive directly.
+	recoveryKey, err := crypto.DeriveKey(code, encrypted.RecoverySalt, iterations)
+	if err != nil {
+		return nil, ErrInvalidRecovery
+	}
+	defer recoveryKey.Destroy()
+
+	plaintext, err := recoveryKey.Decrypt(encrypted.RecoveryData)
+	if err != nil {
+		return nil, ErrInvalidRecovery
+	}
+	defer crypto.SecureWipeBytes(plaintext)
+
+	vaultKey, err := crypto.GenerateRandomBytes(32)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate vault key: %w", err)
+	}
+
+	vaultCiphertext, err := crypto.EncryptWithKey(vaultKey, plaintext)
+	if err != nil {
+		crypto.SecureWipeBytes(vaultKey)
+		return nil, fmt.Errorf("failed to encrypt vault data: %w", err)
+	}
+
+	recoveryWords, err := crypto.GenerateRecoveryPhrase(0)
+	if err != nil {
+		crypto.SecureWipeBytes(vaultKey)
+		return nil, fmt.Errorf("failed to generate new recovery phrase: %w", err)
+	}
+
+	recoverySalt, err := crypto.GenerateRandomBytes(32)
+	if err != nil {
+		crypto.SecureWipeBytes(vaultKey)
+		return nil, fmt.Errorf("failed to generate recovery salt: %w", err)
+	}
+
+	newRecoveryKey, err := crypto.DeriveRecoveryKey(recoveryWords, recoverySalt, iterations)
+	if err != nil {
+		crypto.SecureWipeBytes(vaultKey)
+		return nil, fmt.Errorf("failed to derive new recovery key: %w", err)
+	}
+	defer newRecoveryKey.Destroy()
+
+	recoveryWrap, err := newRecoveryKey.Encrypt(vaultKey)
+	if err != nil {
+		crypto.SecureWipeBytes(vaultKey)
+		return nil, fmt.Errorf("failed to wrap recovery key: %w", err)
+	}
+
+	migrated := &EncryptedVault{
+		Version:         crypto.CryptoVersion,
+		Iterations:      iterations,
+		RecoverySalt:    newRecoveryKey.Salt(),
+		RecoveryWrap:    recoveryWrap,
+		VaultCiphertext: vaultCiphertext,
+	}
+
+	if err := SaveEncryptedVault(vaultPath, migrated); err != nil {
+		crypto.SecureWipeBytes(vaultKey)
+		return nil, fmt.Errorf("failed to save migrated recovery vault: %w", err)
+	}
+
+	return &RecoverySession{
+		encrypted:     migrated,
+		vaultKey:      vaultKey,
+		filePath:      vaultPath,
+		iterations:    iterations,
+		pendingPhrase: crypto.RecoveryPhraseString(recoveryWords),
+	}, nil
 }

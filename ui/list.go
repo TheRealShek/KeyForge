@@ -18,6 +18,7 @@ type ListScreen struct {
 	searchActive  bool
 	errorMsg      string
 	successMsg    string
+	pendingPhrase string
 }
 
 // NewListScreen creates a new credential list screen.
@@ -26,6 +27,11 @@ func NewListScreen(ctx *Context) *ListScreen {
 		ctx:           ctx,
 		selectedIndex: 0,
 	}
+
+	if ctx != nil && ctx.Vault != nil {
+		s.pendingPhrase = ctx.Vault.ConsumePendingRecoveryPhrase()
+	}
+
 	s.loadCredentials()
 	return s
 }
@@ -57,6 +63,15 @@ func (s *ListScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		if s.pendingPhrase != "" {
+			s.errorMsg = ""
+			s.successMsg = ""
+			if msg.String() == "enter" {
+				s.pendingPhrase = ""
+			}
+			return s, nil
+		}
+
 		// Search mode handling
 		if s.searchActive {
 			switch msg.String() {
@@ -158,6 +173,13 @@ func (s *ListScreen) View() string {
 		b.WriteString(HighlightStyle.Render("Search: ") + s.searchQuery + "▊\n\n")
 	} else if s.searchQuery != "" {
 		b.WriteString(fmt.Sprintf("Search: %s (press / to modify, Esc to clear)\n\n", s.searchQuery))
+	}
+
+	if s.pendingPhrase != "" {
+		b.WriteString(HighlightStyle.Render("Recovery phrase (write down now, press Enter to dismiss):"))
+		b.WriteString("\n")
+		b.WriteString(SuccessStyle.Render(s.pendingPhrase))
+		b.WriteString("\n\n")
 	}
 
 	// Credential list

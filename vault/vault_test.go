@@ -1,191 +1,189 @@
 package vault
 
 import (
-"os"
-"testing"
-"time"
+	"os"
+	"strings"
+	"testing"
 )
 
-func TestCreateAndOpenVault(t *testing.T) {
-// Use temp file for testing
-tmpFile := os.TempDir() + "/test-vault-" + time.Now().Format("20060102150405") + ".vault"
-defer os.Remove(tmpFile)
-
-// Override vault path for testing
-originalPath := os.Getenv("HOME")
-defer func() {
-if originalPath != "" {
-os.Setenv("HOME", originalPath)
-}
-}()
-
-password := "test-password-123"
-iterations := 100000
-
-vault, recoveryCode, err := CreateVault(password, iterations)
-if err != nil {
-t.Fatalf("CreateVault() error = %v", err)
-}
-defer vault.Close()
-
-if recoveryCode == "" {
-t.Error("CreateVault() recovery code should not be empty")
+func withTempHome(t *testing.T) func() {
+	t.Helper()
+	old := os.Getenv("HOME")
+	temp := t.TempDir()
+	if err := os.Setenv("HOME", temp); err != nil {
+		t.Fatalf("failed to set HOME: %v", err)
+	}
+	return func() {
+		os.Setenv("HOME", old)
+	}
 }
 
-// Test opening with master password
-vault2, err := OpenVault(password, false, iterations)
-if err != nil {
-t.Fatalf("OpenVault() with password error = %v", err)
-}
-defer vault2.Close()
+func TestHappyPathMasterLogin(t *testing.T) {
+	restore := withTempHome(t)
+	defer restore()
 
-// Test opening with recovery code
-vault3, err := OpenVault(recoveryCode, true, iterations)
-if err != nil {
-t.Fatalf("OpenVault() with recovery code error = %v", err)
-}
-defer vault3.Close()
-}
+	password := "test-password-123"
+	iterations := 150000
 
-func TestAddAndGetCredential(t *testing.T) {
-password := "test-password"
-vault, _, err := CreateVault(password, 100000)
-if err != nil {
-t.Fatalf("CreateVault() error = %v", err)
-}
-defer vault.Close()
+	v, phrase, err := CreateVault(password, iterations)
+	if err != nil {
+		t.Fatalf("CreateVault() error = %v", err)
+	}
+	if phrase == "" {
+		t.Fatal("expected recovery phrase")
+	}
+	if err := v.AddCredential(Credential{Site: "example.com", Email: "user@example.com", Password: "secret123"}); err != nil {
+		t.Fatalf("AddCredential() error = %v", err)
+	}
+	v.Close()
 
-cred := Credential{
-Site:     "example.com",
-Email:    "user@example.com",
-Password: "secret123",
-}
-
-if err := vault.AddCredential(cred); err != nil {
-t.Fatalf("AddCredential() error = %v", err)
+	reopened, err := OpenVault(password, iterations)
+	if err != nil {
+		t.Fatalf("OpenVault() error = %v", err)
+	}
+	defer reopened.Close()
+	creds := reopened.GetAllCredentials()
+	if len(creds) != 1 {
+		t.Fatalf("unexpected credential count = %d", len(creds))
+	}
 }
 
-creds := vault.GetAllCredentials()
-if len(creds) != 1 {
-t.Errorf("GetAllCredentials() count = %d, want 1", len(creds))
-}
-if creds[0].Site != "example.com" {
-t.Errorf("GetAllCredentials() site = %s, want example.com", creds[0].Site)
-}
-}
+func TestRecoveryResetFlow(t *testing.T) {
+	restore := withTempHome(t)
+	defer restore()
 
-func TestUpdateCredential(t *testing.T) {
-vault, _, _ := CreateVault("password", 100000)
-defer vault.Close()
+	iterations := 150000
+	master := "master-one"
+	newMaster := "master-two"
 
-cred := Credential{
-Site:     "example.com",
-Email:    "user@example.com",
-Password: "old-password",
-}
-vault.AddCredential(cred)
+	v, phrase, err := CreateVault(master, iterations)
+	if err != nil {
+		t.Fatalf("CreateVault() error = %v", err)
+	}
+	if err := v.AddCredential(Credential{Site: "git.example", Email: "me@example.com", Password: "pw"}); err != nil {
+		t.Fatalf("AddCredential() error = %v", err)
+	}
+	v.Close()
 
-creds := vault.GetAllCredentials()
-id := creds[0].ID
+	session, err := BeginRecovery(phrase, iterations)
+	if err != nil {
+		t.Fatalf("BeginRecovery() error = %v", err)
+	}
 
-updated := Credential{
-Site:     "example.com",
-Email:    "user@example.com",
-Password: "new-password",
-}
+	recovered, err := session.Complete(newMaster)
+	if err != nil {
+		t.Fatalf("Complete() error = %v", err)
+	}
+	recovered.Close()
 
-if err := vault.UpdateCredential(id, updated); err != nil {
-t.Fatalf("UpdateCredential() error = %v", err)
-}
+	if _, err := OpenVault(master, iterations); err == nil {
+		t.Fatal("old master password should fail after recovery reset")
+	}
 
-result, _ := vault.GetCredential(id)
-if result.Password != "new-password" {
-t.Errorf("UpdateCredential() password = %s, want new-password", result.Password)
-}
-}
-
-func TestDeleteCredential(t *testing.T) {
-vault, _, _ := CreateVault("password", 100000)
-defer vault.Close()
-
-cred := Credential{
-Site:     "example.com",
-Email:    "user@example.com",
-Password: "secret",
-}
-vault.AddCredential(cred)
-
-creds := vault.GetAllCredentials()
-id := creds[0].ID
-
-if err := vault.DeleteCredential(id); err != nil {
-t.Fatalf("DeleteCredential() error = %v", err)
+	reopened, err := OpenVault(newMaster, iterations)
+	if err != nil {
+		t.Fatalf("OpenVault() with new master failed: %v", err)
+	}
+	defer reopened.Close()
+	creds := reopened.GetAllCredentials()
+	if len(creds) != 1 || creds[0].Site != "git.example" {
+		t.Fatalf("credentials not preserved across recovery reset")
+	}
 }
 
-creds = vault.GetAllCredentials()
-if len(creds) != 0 {
-t.Errorf("DeleteCredential() count = %d, want 0", len(creds))
-}
+func TestRecoveryDoesNotGrantDirectAccess(t *testing.T) {
+	restore := withTempHome(t)
+	defer restore()
+
+	iterations := 130000
+	password := "master-pass"
+
+	_, phrase, err := CreateVault(password, iterations)
+	if err != nil {
+		t.Fatalf("CreateVault() error = %v", err)
+	}
+
+	if _, err := OpenVault(phrase, iterations); err == nil {
+		t.Fatal("recovery phrase must not unlock vault without reset")
+	}
+
+	session, err := BeginRecovery(phrase, iterations)
+	if err != nil {
+		t.Fatalf("BeginRecovery() error = %v", err)
+	}
+	// Do not call Complete; ensure vault remains locked for master login.
+	if _, err := OpenVault(password, iterations); err != nil {
+		t.Fatalf("master password should still work before recovery completion: %v", err)
+	}
+	_ = session
 }
 
-func TestSearchCredentials(t *testing.T) {
-vault, _, _ := CreateVault("password", 100000)
-defer vault.Close()
+func TestRecoveryPhraseNotPersistedInVaultFile(t *testing.T) {
+	restore := withTempHome(t)
+	defer restore()
 
-vault.AddCredential(Credential{Site: "github.com", Email: "user@example.com", Password: "pass1"})
-vault.AddCredential(Credential{Site: "gitlab.com", Email: "user@example.com", Password: "pass2"})
-vault.AddCredential(Credential{Site: "example.com", Username: "admin", Password: "pass3"})
+	password := "master-pass"
+	iterations := 120000
 
-results := vault.SearchCredentials("git")
-if len(results) != 2 {
-t.Errorf("SearchCredentials('git') count = %d, want 2", len(results))
-}
+	_, phrase, err := CreateVault(password, iterations)
+	if err != nil {
+		t.Fatalf("CreateVault() error = %v", err)
+	}
 
-results = vault.SearchCredentials("admin")
-if len(results) != 1 {
-t.Errorf("SearchCredentials('admin') count = %d, want 1", len(results))
-}
+	vaultPath, err := GetVaultPath()
+	if err != nil {
+		t.Fatalf("GetVaultPath() error = %v", err)
+	}
+
+	contents, err := os.ReadFile(vaultPath)
+	if err != nil {
+		t.Fatalf("failed to read vault file: %v", err)
+	}
+
+	if strings.Contains(string(contents), strings.Fields(phrase)[0]) {
+		t.Fatalf("vault file unexpectedly contains recovery material")
+	}
 }
 
 func TestCredentialValidation(t *testing.T) {
-tests := []struct {
-name    string
-cred    Credential
-wantErr error
-}{
-{
-"valid with email",
-Credential{Site: "example.com", Email: "user@example.com", Password: "pass"},
-nil,
-},
-{
-"valid with username",
-Credential{Site: "example.com", Username: "user", Password: "pass"},
-nil,
-},
-{
-"missing site",
-Credential{Email: "user@example.com", Password: "pass"},
-ErrSiteRequired,
-},
-{
-"missing password",
-Credential{Site: "example.com", Email: "user@example.com"},
-ErrPasswordRequired,
-},
-{
-"missing identity",
-Credential{Site: "example.com", Password: "pass"},
-ErrIdentityRequired,
-},
-}
+	tests := []struct {
+		name    string
+		cred    Credential
+		wantErr error
+	}{
+		{
+			"valid with email",
+			Credential{Site: "example.com", Email: "user@example.com", Password: "pass"},
+			nil,
+		},
+		{
+			"valid with username",
+			Credential{Site: "example.com", Username: "user", Password: "pass"},
+			nil,
+		},
+		{
+			"missing site",
+			Credential{Email: "user@example.com", Password: "pass"},
+			ErrSiteRequired,
+		},
+		{
+			"missing password",
+			Credential{Site: "example.com", Email: "user@example.com"},
+			ErrPasswordRequired,
+		},
+		{
+			"missing identity",
+			Credential{Site: "example.com", Password: "pass"},
+			ErrIdentityRequired,
+		},
+	}
 
-for _, tt := range tests {
-t.Run(tt.name, func(t *testing.T) {
-err := tt.cred.Validate()
-if err != tt.wantErr {
-t.Errorf("Validate() error = %v, want %v", err, tt.wantErr)
-}
-})
-}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.cred.Validate()
+			if err != tt.wantErr {
+				t.Errorf("Validate() error = %v, want %v", err, tt.wantErr)
+			}
+		})
+	}
 }

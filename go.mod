@@ -8,6 +8,7 @@ require (
 	github.com/charmbracelet/bubbletea v0.25.0
 	github.com/charmbracelet/lipgloss v0.9.1
 	github.com/google/uuid v1.6.0
+	github.com/tyler-smith/go-bip39 v1.1.0
 	golang.org/x/crypto v0.17.0
 )
 

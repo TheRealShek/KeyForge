@@ -43,25 +43,25 @@ func (s *LoginScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 				return s, nil
 			}
 
-			// Try master password first, then recovery code
-			v, err := vault.OpenVault(password, false, 310000)
-			if err != nil {
-				v, err = vault.OpenVault(password, true, 310000)
-				if err != nil {
-					s.errorMsg = "Invalid password or recovery code"
-					s.input.SetValue("")
-					return s, nil
+			v, err := vault.OpenVault(password, 310000)
+			if err == nil {
+				ctx := &Context{
+					Vault:            v,
+					Config:           s.config,
+					ClipboardManager: s.clipboardManager,
+					LastActivity:     time.Now(),
 				}
+				return NewListScreen(ctx), nil
 			}
 
-			// Successfully logged in
-			ctx := &Context{
-				Vault:            v,
-				Config:           s.config,
-				ClipboardManager: s.clipboardManager,
-				LastActivity:     time.Now(),
+			session, recErr := vault.BeginRecovery(password, 310000)
+			if recErr != nil {
+				s.errorMsg = "Invalid password or recovery code"
+				s.input.SetValue("")
+				return s, nil
 			}
-			return NewListScreen(ctx), nil
+
+			return NewRecoveryResetScreen(session, s.config, s.clipboardManager), nil
 		}
 	}
 

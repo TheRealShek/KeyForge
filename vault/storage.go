@@ -10,14 +10,24 @@ import (
 )
 
 // EncryptedVault represents the on-disk vault format.
+// Version 1 fields are preserved for migration; version 2 introduces
+// vault-key wrapping instead of direct master/recovery encryption.
 type EncryptedVault struct {
-	Version               int    `json:"version"`
-	MasterSalt            []byte `json:"master_salt"`
-	RecoverySalt          []byte `json:"recovery_salt"`
-	MasterData            []byte `json:"master_data"`
-	RecoveryData          []byte `json:"recovery_data"`
-	RecoveryHash          []byte `json:"recovery_hash"`
-	EncryptedRecoveryCode []byte `json:"encrypted_recovery_code"` // Recovery code encrypted with master key
+	Version      int    `json:"version"`
+	Iterations   int    `json:"iterations"`
+	MasterSalt   []byte `json:"master_salt"`
+	RecoverySalt []byte `json:"recovery_salt,omitempty"`
+
+	// Legacy (v1)
+	MasterData            []byte `json:"master_data,omitempty"`
+	RecoveryData          []byte `json:"recovery_data,omitempty"`
+	RecoveryHash          []byte `json:"recovery_hash,omitempty"`
+	EncryptedRecoveryCode []byte `json:"encrypted_recovery_code,omitempty"`
+
+	// v2 vault-key wrapping
+	VaultCiphertext []byte `json:"vault_ciphertext,omitempty"`
+	MasterWrap      []byte `json:"master_wrap,omitempty"`
+	RecoveryWrap    []byte `json:"recovery_wrap,omitempty"`
 }
 
 // VaultData is the decrypted vault contents.
