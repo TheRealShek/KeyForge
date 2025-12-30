@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"keyforge/clipboard"
 	"keyforge/vault"
 	"strings"
 	"time"
@@ -12,16 +13,17 @@ import (
 
 // SetupScreen handles initial vault creation.
 type SetupScreen struct {
-	inputs       []textinput.Model
-	cursor       int
-	errorMsg     string
-	recoveryCode string
-	config       *Config
-	vault        *vault.Vault
+	inputs           []textinput.Model
+	cursor           int
+	errorMsg         string
+	recoveryCode     string
+	config           *Config
+	vault            *vault.Vault
+	clipboardManager *clipboard.Manager
 }
 
 // NewSetupScreen creates a new setup screen.
-func NewSetupScreen(config *Config) *SetupScreen {
+func NewSetupScreen(config *Config, clipboardManager *clipboard.Manager) *SetupScreen {
 	inputs := make([]textinput.Model, 2)
 
 	inputs[0] = textinput.New()
@@ -34,9 +36,10 @@ func NewSetupScreen(config *Config) *SetupScreen {
 	inputs[1].EchoMode = textinput.EchoPassword
 
 	return &SetupScreen{
-		inputs: inputs,
-		cursor: 0,
-		config: config,
+		inputs:           inputs,
+		cursor:           0,
+		config:           config,
+		clipboardManager: clipboardManager,
 	}
 }
 
@@ -88,8 +91,10 @@ func (s *SetupScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 	case HideRecoveryMsg:
 		if s.recoveryCode != "" {
 			ctx := &Context{
-				Vault:  s.vault,
-				Config: s.config,
+				Vault:            s.vault,
+				Config:           s.config,
+				ClipboardManager: s.clipboardManager,
+				LastActivity:     time.Now(),
 			}
 			return NewListScreen(ctx), nil
 		}

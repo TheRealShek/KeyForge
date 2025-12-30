@@ -1,8 +1,10 @@
 package ui
 
 import (
+	"keyforge/clipboard"
 	"keyforge/vault"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -10,21 +12,23 @@ import (
 
 // LoginScreen handles user authentication.
 type LoginScreen struct {
-	input    textinput.Model
-	errorMsg string
-	config   *Config
+	input            textinput.Model
+	errorMsg         string
+	config           *Config
+	clipboardManager *clipboard.Manager
 }
 
 // NewLoginScreen creates a new login screen.
-func NewLoginScreen(config *Config) *LoginScreen {
+func NewLoginScreen(config *Config, clipboardManager *clipboard.Manager) *LoginScreen {
 	input := textinput.New()
 	input.Placeholder = "Master password or recovery code"
 	input.EchoMode = textinput.EchoPassword
 	input.Focus()
 
 	return &LoginScreen{
-		input:  input,
-		config: config,
+		input:            input,
+		config:           config,
+		clipboardManager: clipboardManager,
 	}
 }
 
@@ -52,8 +56,10 @@ func (s *LoginScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 
 			// Successfully logged in
 			ctx := &Context{
-				Vault:  v,
-				Config: s.config,
+				Vault:            v,
+				Config:           s.config,
+				ClipboardManager: s.clipboardManager,
+				LastActivity:     time.Now(),
 			}
 			return NewListScreen(ctx), nil
 		}

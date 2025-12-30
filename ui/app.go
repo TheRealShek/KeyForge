@@ -33,9 +33,9 @@ func NewApp(config *Config) *App {
 	// Determine initial screen
 	exists, err := vault.VaultExists()
 	if err != nil || !exists {
-		app.screen = NewSetupScreen(config)
+		app.screen = NewSetupScreen(config, clipMgr)
 	} else {
-		app.screen = NewLoginScreen(config)
+		app.screen = NewLoginScreen(config, clipMgr)
 	}
 
 	return app
@@ -74,9 +74,10 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if a.ctx != nil && a.ctx.Vault != nil {
 			if time.Since(a.ctx.LastActivity) > a.config.InactivityTimeout {
 				// Lock the vault
+				a.clipboardManager.ClearNow()
 				a.ctx.Vault.Close()
 				a.ctx.Vault = nil
-				a.screen = NewLoginScreen(a.config)
+				a.screen = NewLoginScreen(a.config, a.clipboardManager)
 				return a, tickCmd()
 			}
 		}

@@ -11,12 +11,13 @@ import (
 
 // EncryptedVault represents the on-disk vault format.
 type EncryptedVault struct {
-	Version      int    `json:"version"`
-	MasterSalt   []byte `json:"master_salt"`
-	RecoverySalt []byte `json:"recovery_salt"`
-	MasterData   []byte `json:"master_data"`
-	RecoveryData []byte `json:"recovery_data"`
-	RecoveryHash []byte `json:"recovery_hash"`
+	Version               int    `json:"version"`
+	MasterSalt            []byte `json:"master_salt"`
+	RecoverySalt          []byte `json:"recovery_salt"`
+	MasterData            []byte `json:"master_data"`
+	RecoveryData          []byte `json:"recovery_data"`
+	RecoveryHash          []byte `json:"recovery_hash"`
+	EncryptedRecoveryCode []byte `json:"encrypted_recovery_code"` // Recovery code encrypted with master key
 }
 
 // VaultData is the decrypted vault contents.

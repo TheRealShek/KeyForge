@@ -83,13 +83,22 @@ func CreateVault(masterPassword string, iterations int) (*Vault, string, error) 
 	}
 	defer recoveryHash.Destroy()
 
+	// Encrypt recovery code with master key for future use
+	encryptedRecoveryCode, err := masterKey.Encrypt([]byte(recoveryCode))
+	if err != nil {
+		masterKey.Destroy()
+		recoveryKey.Destroy()
+		return nil, "", fmt.Errorf("failed to encrypt recovery code: %w", err)
+	}
+
 	encrypted := &EncryptedVault{
-		Version:      crypto.CryptoVersion,
-		MasterSalt:   masterKey.Salt(),
-		RecoverySalt: recoveryKey.Salt(),
-		MasterData:   masterData,
-		RecoveryData: recoveryData,
-		RecoveryHash: recoveryHash.Salt(), // Store as verification hash
+		Version:               crypto.CryptoVersion,
+		MasterSalt:            masterKey.Salt(),
+		RecoverySalt:          recoveryKey.Salt(),
+		MasterData:            masterData,
+		RecoveryData:          recoveryData,
+		RecoveryHash:          recoveryHash.Salt(), // Store as verification hash
+		EncryptedRecoveryCode: encryptedRecoveryCode,
 	}
 
 	vaultPath, err := GetVaultPath()
@@ -164,9 +173,21 @@ func OpenVault(password string, isRecoveryCode bool, iterations int) (*Vault, er
 		}
 		encryptedData = encrypted.MasterData
 
-		// Derive recovery key for dual updates
-		// Note: We don't have the recovery code, so this is a limitation
-		// In production, store encrypted recovery code or prompt on password change
+		// Decrypt stored recovery code to derive recovery key
+		if len(encrypted.EncryptedRecoveryCode) > 0 {
+			recoveryCodeBytes, err := key.Decrypt(encrypted.EncryptedRecoveryCode)
+			if err != nil {
+				key.Destroy()
+				return nil, fmt.Errorf("failed to decrypt recovery code: %w", err)
+			}
+			defer crypto.SecureWipeBytes(recoveryCodeBytes)
+
+			recoveryKey, err = crypto.DeriveKey(string(recoveryCodeBytes), encrypted.RecoverySalt, iterations)
+			if err != nil {
+				key.Destroy()
+				return nil, fmt.Errorf("failed to derive recovery key from stored code: %w", err)
+			}
+		}
 	}
 
 	jsonData, err := key.Decrypt(encryptedData)
@@ -371,6 +392,27 @@ func (v *Vault) ChangeMasterPassword(newPassword string) error {
 			return fmt.Errorf("failed to re-encrypt with recovery key: %w", err)
 		}
 		v.encrypted.RecoveryData = recoveryData
+
+		// Re-encrypt recovery code with new master key
+		// First, get the recovery code by deriving from recovery key salt
+		// We need to store the plaintext recovery code temporarily
+		// For now, decrypt the old encrypted recovery code first
+		if len(v.encrypted.EncryptedRecoveryCode) > 0 {
+			recoveryCodeBytes, err := v.masterKey.Decrypt(v.encrypted.EncryptedRecoveryCode)
+			if err != nil {
+				newKey.Destroy()
+				return fmt.Errorf("failed to decrypt recovery code: %w", err)
+			}
+			defer crypto.SecureWipeBytes(recoveryCodeBytes)
+
+			// Re-encrypt with new master key
+			newEncryptedRecoveryCode, err := newKey.Encrypt(recoveryCodeBytes)
+			if err != nil {
+				newKey.Destroy()
+				return fmt.Errorf("failed to re-encrypt recovery code: %w", err)
+			}
+			v.encrypted.EncryptedRecoveryCode = newEncryptedRecoveryCode
+		}
 	}
 
 	if err := SaveEncryptedVault(v.filePath, v.encrypted); err != nil {
